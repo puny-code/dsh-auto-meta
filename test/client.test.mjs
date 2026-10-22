@@ -276,3 +276,45 @@ test('models listed without efforts stay unanswered instead of being guessed', (
   assert.equal(fields.reasoningEfforts, undefined, 'no reasoning object means the levels are left untouched');
   assert.equal(fields.contextWindow, 1050000);
 });
+
+test('normalizeSettings falls back to the documented defaults', () => {
+  assert.deepEqual(pure.normalizeSettings(undefined), {
+    source: 'openrouter+modelsdev',
+    fields: { contextWindow: true, maxTokens: false, input: true, reasoning: true },
+    writeMode: 'keep',
+  });
+  assert.deepEqual(pure.normalizeSettings({}), pure.normalizeSettings(undefined));
+  assert.deepEqual(pure.normalizeSettings({ source: 'nope', writeMode: 'replace' }), pure.normalizeSettings(undefined));
+});
+
+test('normalizeSettings keeps explicit choices, including turning fields off', () => {
+  const config = pure.normalizeSettings({
+    source: 'modelsdev',
+    fields: { contextWindow: false, maxTokens: true, input: false, reasoning: false },
+    writeMode: 'overwrite',
+  });
+  assert.equal(config.source, 'modelsdev');
+  assert.equal(config.writeMode, 'overwrite');
+  assert.deepEqual(config.fields, { contextWindow: false, maxTokens: true, input: false, reasoning: false });
+});
+
+test('normalizeSettings only treats a literal true as enabled', () => {
+  const config = pure.normalizeSettings({ fields: { contextWindow: 'yes', input: 1 } });
+  assert.equal(config.fields.contextWindow, false, 'a truthy string is not an opt-in');
+  assert.equal(config.fields.input, false, 'a truthy number is not an opt-in');
+  assert.equal(config.fields.reasoning, true, 'an absent field keeps its default');
+});
+
+test('decideWrite: keep mode only fills what is empty', () => {
+  assert.equal(pure.decideWrite(true, false, false), 'write');
+  assert.equal(pure.decideWrite(true, false, true), 'skip');
+  assert.equal(pure.decideWrite(false, false, false), 'skip');
+  assert.equal(pure.decideWrite(false, false, true), 'skip');
+});
+
+test('decideWrite: overwrite mode always writes, and clears the unticked fields', () => {
+  assert.equal(pure.decideWrite(true, true, false), 'write');
+  assert.equal(pure.decideWrite(true, true, true), 'write');
+  assert.equal(pure.decideWrite(false, true, false), 'clear');
+  assert.equal(pure.decideWrite(false, true, true), 'clear');
+});

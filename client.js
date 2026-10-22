@@ -50,11 +50,66 @@ window.__ModuleLoader__.load({
     const FUZZY_FLOOR = 0.8;
     const STATE_MS = 1600;
 
+    /** IndexedDB key holding the Auto-Meta tab's three preferences. */
+    const SETTINGS_KEY = 'settings';
+    /** Where the Auto-Meta tab sits: right under "模型" (order 10), before "插件" (15). */
+    const SECTION_ID = 'auto-meta';
+    const SECTION_ORDER = 12;
+    const SECTION_LABEL = 'Auto-Meta';
+    const SOURCES = ['openrouter+modelsdev', 'openrouter', 'modelsdev'];
+    const SOURCE_LABELS = {
+      'openrouter+modelsdev': 'OpenRouter → models.dev',
+      openrouter: '仅 OpenRouter',
+      modelsdev: '仅 models.dev',
+    };
+    const FIELD_LABELS = {
+      contextWindow: '上下文窗口',
+      maxTokens: '最大输出 token 数',
+      input: '输入类型',
+      reasoning: '推理档位',
+    };
+    /** Defaults: every field but the output cap, and never overwrite silently. */
+    const DEFAULT_SETTINGS = {
+      source: 'openrouter+modelsdev',
+      fields: { contextWindow: true, maxTokens: false, input: true, reasoning: true },
+      writeMode: 'keep',
+    };
+
     /** pi-ai's thinking levels, ascending. */
     const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
     /** pi-ai's input modalities, canonical order. */
     const MODALITIES = ['text', 'image'];
     const OFF_ALIASES = new Set(['none', 'off', 'disabled', 'no', 'false']);
+
+    /** Coerce a stored blob into the three known choices; anything else defaults. */
+    function normalizeSettings(raw) {
+      const source = raw !== null && typeof raw === 'object' ? raw : {};
+      const fields = source.fields !== null && typeof source.fields === 'object' ? source.fields : {};
+      const pick = (key, fallback) => (fields[key] === undefined ? fallback : fields[key] === true);
+      return {
+        source: SOURCES.indexOf(source.source) === -1 ? DEFAULT_SETTINGS.source : source.source,
+        fields: {
+          contextWindow: pick('contextWindow', DEFAULT_SETTINGS.fields.contextWindow),
+          maxTokens: pick('maxTokens', DEFAULT_SETTINGS.fields.maxTokens),
+          input: pick('input', DEFAULT_SETTINGS.fields.input),
+          reasoning: pick('reasoning', DEFAULT_SETTINGS.fields.reasoning),
+        },
+        writeMode: source.writeMode === 'overwrite' ? 'overwrite' : 'keep',
+      };
+    }
+
+    /**
+     * What to do with one field: `'write'`, `'clear'` or `'skip'`.
+     *
+     * - Field ticked, keep mode: only filled when the row has nothing there.
+     * - Field ticked, overwrite mode: always filled.
+     * - Field unticked, overwrite mode: cleared, so the result matches the tab.
+     * - Field unticked, keep mode: left alone.
+     */
+    function decideWrite(enabled, overwrite, hasValue) {
+      if (enabled === true) return overwrite === true || hasValue !== true ? 'write' : 'skip';
+      return overwrite === true ? 'clear' : 'skip';
+    }
 
     /* ───────────────────────── pure logic (testable) ─────────────────────── */
 
@@ -515,6 +570,22 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** In-memory copy of the Auto-Meta tab so a fill never awaits IndexedDB twice. */
+    let settingsCache;
+
+    async function settingsLoad() {
+      if (settingsCache !== undefined) return settingsCache;
+      settingsCache = normalizeSettings(await cacheRead(SETTINGS_KEY));
+      return settingsCache;
+    }
+
+    async function settingsSave(next) {
+      const merged = normalizeSettings(next);
+      settingsCache = merged;
+      await cacheWrite(SETTINGS_KEY, merged);
+      return merged;
+    }
+
     async function fetchJson(url) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -582,15 +653,22 @@ window.__ModuleLoader__.load({
      * that models.dev states wrong thinking levels for some models while
      * OpenRouter has them right.
      */
-    async function resolveForRow(modelId) {
-      const catalog = await openRouterCatalog();
-      const hit = matchOpenRouter(catalog, modelId);
-      const fields = hit.record === undefined ? {} : deriveFields(hit.record);
+    async function resolveForRow(modelId, source) {
+      const mode = SOURCES.indexOf(source) === -1 ? DEFAULT_SETTINGS.source : source;
+      const useOpenRouter = mode !== 'modelsdev';
+      const useModelsDev = mode !== 'openrouter';
+      let fields = {};
+      let hit = { record: undefined, tier: 'none', score: 0 };
+      if (useOpenRouter) {
+        const catalog = await openRouterCatalog();
+        hit = matchOpenRouter(catalog, modelId);
+        fields = hit.record === undefined ? {} : deriveFields(hit.record);
+      }
       const sources = [];
       if (hit.record !== undefined) sources.push('openrouter');
 
       const gaps = FIELD_KEYS.filter((key) => fields[key] === undefined);
-      if (gaps.length > 0) {
+      if (useModelsDev && gaps.length > 0) {
         const fallback = await modelsDevCatalog();
         if (fallback !== undefined) {
           const meta = resolveMeta(modelsDevIndex(fallback.providers), modelId, '');
@@ -861,33 +939,109 @@ window.__ModuleLoader__.load({
       return true;
     }
 
-    /** Fill one row from its model id; returns the outcome plus its provenance. */
-    async function fillRow(row) {
+    /** Switch the thinking levels off and drop every row, so "clear" means clear. */
+    async function clearReasoning(panel) {
+      const group = reasoningGroup(panel);
+      if (group === undefined) return false;
+      const toggle = group.querySelector('button[role="switch"]');
+      if (toggle !== null && toggle.getAttribute('aria-checked') === 'true') {
+        toggle.click();
+        await tick();
+      }
+      for (let guard = 0; guard < 16; guard += 1) {
+        const rows = [...group.querySelectorAll(ROW_SELECTOR)];
+        if (rows.length === 0) return true;
+        const remove = buttonByLabel(rows[rows.length - 1], /删除/);
+        if (remove === undefined) return false;
+        remove.click();
+        await tick();
+      }
+      return false;
+    }
+
+    /** Fill one row from its model id, honouring the Auto-Meta tab's choices. */
+    async function fillRow(row, settings) {
+      const config = settings === undefined ? await settingsLoad() : settings;
       const modelId = modelIdOf(row);
       if (modelId === '') return { outcome: 'empty' };
-      const resolved = await resolveForRow(modelId);
+      const resolved = await resolveForRow(modelId, config.source);
       const fields = resolved.fields;
-      if (Object.keys(fields).length === 0) return { outcome: 'miss' };
       const chevron = row.querySelector('button[aria-expanded]');
       if (chevron === null) return { outcome: 'miss' };
       const panel = await openPanel(chevron, row);
       if (panel === undefined) return { outcome: 'miss' };
+
+      const enabled = config.fields;
+      const overwrite = config.writeMode === 'overwrite';
+      let changed = 0;
+      let skipped = 0;
+
       const numbers = numericInputs(panel);
-      if (fields.contextWindow !== undefined && numbers.contextWindow) {
-        setInput(numbers.contextWindow, String(fields.contextWindow));
+      const writeNumber = (element, key, value) => {
+        if (element === null || element === undefined) return;
+        const action = decideWrite(enabled[key], overwrite, String(element.value || '') !== '');
+        if (action === 'write' && value !== undefined) {
+          setInput(element, String(value));
+          changed += 1;
+        } else if (action === 'clear' && String(element.value || '') !== '') {
+          setInput(element, '');
+          changed += 1;
+        } else if (action === 'skip') {
+          skipped += 1;
+        }
+      };
+      writeNumber(numbers.contextWindow, 'contextWindow', fields.contextWindow);
+      writeNumber(numbers.maxTokens, 'maxTokens', fields.maxTokens);
+
+      const boxes = [...panel.querySelectorAll('fieldset input[type="checkbox"]')];
+      if (boxes.length > 0) {
+        const current = boxes
+          .map((box, index) => (box.checked ? MODALITIES[index] : undefined))
+          .filter((value) => value !== undefined);
+        const action = decideWrite(enabled.input, overwrite, current.length > 0);
+        if (action === 'clear') {
+          if (fillInputs(panel, [])) changed += 1;
+        } else if (action === 'write' && fields.input !== undefined) {
+          // Overwrite states the whole set; keep only tops up what is missing,
+          // so a row already ticked "text" also gains "image" without losing
+          // anything the user added by hand.
+          const target =
+            overwrite === true
+              ? fields.input
+              : current.concat(fields.input.filter((modality) => current.indexOf(modality) === -1));
+          if (fillInputs(panel, target)) changed += 1;
+        } else if (action === 'skip') {
+          const missing =
+            fields.input === undefined ? [] : fields.input.filter((modality) => current.indexOf(modality) === -1);
+          if (missing.length > 0 && fillInputs(panel, current.concat(missing))) changed += 1;
+          else skipped += 1;
+        }
       }
-      if (fields.maxTokens !== undefined && numbers.maxTokens) {
-        setInput(numbers.maxTokens, String(fields.maxTokens));
+
+      const group = reasoningGroup(panel);
+      if (group !== undefined) {
+        const toggle = group.querySelector('button[role="switch"]');
+        const on = toggle !== null && toggle.getAttribute('aria-checked') === 'true';
+        const hasValue = on || currentLevels(group).length > 0;
+        const action = decideWrite(enabled.reasoning, overwrite, hasValue);
+        if (action === 'write' && fields.reasoningEfforts !== undefined) {
+          if (await fillReasoning(panel, fields.reasoningEfforts)) changed += 1;
+        } else if (action === 'clear') {
+          if (await clearReasoning(panel)) changed += 1;
+        } else if (action === 'skip') {
+          skipped += 1;
+        }
       }
-      if (fields.input !== undefined) fillInputs(panel, fields.input);
-      if (fields.reasoningEfforts !== undefined) await fillReasoning(panel, fields.reasoningEfforts);
-      return {
-        outcome: 'ok',
+
+      const provenance = {
         tier: resolved.tier,
         matched: resolved.matched,
         score: resolved.score,
         sources: resolved.sources,
       };
+      if (changed > 0) return { outcome: 'ok', ...provenance };
+      if (skipped > 0) return { outcome: 'kept', ...provenance };
+      return { outcome: 'miss', ...provenance };
     }
 
     /** Tooltip for a successful fill: say when the hit was fuzzy or mixed. */
@@ -944,8 +1098,9 @@ window.__ModuleLoader__.load({
         fillRow(row).then(
           (result) => {
             if (result.outcome === 'ok') flash(button, 'ok', filledMessage(result));
+            else if (result.outcome === 'kept') flash(button, 'ok', '已有值，按设置保留');
             else if (result.outcome === 'empty') flash(button, 'miss', '先填写模型 ID');
-            else if (result.outcome === 'miss') flash(button, 'miss', 'OpenRouter 与 models.dev 均未收录该模型');
+            else if (result.outcome === 'miss') flash(button, 'miss', '数据源未收录该模型');
             else flash(button, 'error', '该行缺少可填写项');
           },
           () => flash(button, 'error', '参数获取失败'),
@@ -1012,15 +1167,135 @@ window.__ModuleLoader__.load({
       document.head.appendChild(style);
     }
 
+    /* ──────────────────────────── Auto-Meta tab ──────────────────────────── */
+
+    const TAB_STYLE_ID = 'dsh-auto-meta/tab-style';
+
+    function injectTabStyle() {
+      if (document.getElementById(TAB_STYLE_ID) !== null) return;
+      const style = document.createElement('style');
+      style.id = TAB_STYLE_ID;
+      style.textContent = [
+        '.dsh-am{display:flex;flex-direction:column;gap:22px;max-width:680px;padding:4px 0}',
+        '.dsh-am-group{display:flex;flex-direction:column;gap:8px}',
+        '.dsh-am-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}',
+        '.dsh-am-hint{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,#6b7280);margin:0}',
+        '.dsh-am-option{display:flex;align-items:flex-start;gap:8px;font-size:13px;line-height:1.5;cursor:pointer;color:var(--dsw-alias-label-primary,#1f2329)}',
+        '.dsh-am-option input{margin:3px 0 0;flex:none;cursor:pointer}',
+        '.dsh-am-option small{display:block;font-size:12px;color:var(--dsw-alias-label-secondary,#6b7280)}',
+      ].join('\n');
+      document.head.appendChild(style);
+    }
+
+    /** The Auto-Meta settings page: three groups, each saved on change. */
+    function makeTabComponent(React) {
+      const h = React.createElement;
+      return function AutoMetaSection() {
+        const [config, setConfig] = React.useState(DEFAULT_SETTINGS);
+        React.useEffect(() => {
+          let alive = true;
+          settingsLoad().then(
+            (loaded) => {
+              if (alive) setConfig(loaded);
+            },
+            () => {},
+          );
+          return () => {
+            alive = false;
+          };
+        }, []);
+
+        const save = (next) => {
+          const merged = normalizeSettings(next);
+          setConfig(merged);
+          settingsSave(merged).catch(() => {});
+        };
+        const setField = (key) => {
+          const fields = Object.assign({}, config.fields);
+          fields[key] = config.fields[key] !== true;
+          save(Object.assign({}, config, { fields }));
+        };
+
+        const radio = (groupName, value, current, onPick, label, hint) =>
+          h(
+            'label',
+            { className: 'dsh-am-option', key: groupName + ':' + value },
+            h('input', {
+              type: 'radio',
+              name: 'dsh-am-' + groupName,
+              checked: current === value,
+              onChange: () => onPick(value),
+            }),
+            h('span', null, label, hint === undefined ? null : h('small', null, hint)),
+          );
+
+        const check = (key, label, hint) =>
+          h(
+            'label',
+            { className: 'dsh-am-option', key: key },
+            h('input', {
+              type: 'checkbox',
+              checked: config.fields[key] === true,
+              onChange: () => setField(key),
+            }),
+            h('span', null, label, hint === undefined ? null : h('small', null, hint)),
+          );
+
+        const group = (title, hint, children) =>
+          h(
+            'div',
+            { className: 'dsh-am-group' },
+            h('div', { className: 'dsh-am-title' }, title),
+            hint === undefined ? null : h('p', { className: 'dsh-am-hint' }, hint),
+            ...children,
+          );
+
+        return h(
+          'div',
+          { className: 'dsh-am' },
+          group('数据来源', '自动填写时先查哪个目录。OpenRouter 的推理档位更准，models.dev 覆盖面更广。', [
+            radio('source', 'openrouter+modelsdev', config.source, (value) => save(Object.assign({}, config, { source: value })), SOURCE_LABELS['openrouter+modelsdev'], '先 OpenRouter，缺的字段再问 models.dev（默认）'),
+            radio('source', 'openrouter', config.source, (value) => save(Object.assign({}, config, { source: value })), SOURCE_LABELS.openrouter, '只认 OpenRouter，查不到就不填'),
+            radio('source', 'modelsdev', config.source, (value) => save(Object.assign({}, config, { source: value })), SOURCE_LABELS.modelsdev, '只认 models.dev，推理档位可能不准'),
+          ]),
+          group('填写字段', '勾选的字段才会被写入。', [
+            check('contextWindow', FIELD_LABELS.contextWindow),
+            check('maxTokens', FIELD_LABELS.maxTokens, '默认不勾选：上游常对输出上限有更小的硬限制'),
+            check('input', FIELD_LABELS.input),
+            check('reasoning', FIELD_LABELS.reasoning, '写入时会一并把思考等级开关切到对应状态'),
+          ]),
+          group('写入行为', '目标行里已经有值的时候怎么办。', [
+            radio('writeMode', 'keep', config.writeMode, (value) => save(Object.assign({}, config, { writeMode: value })), '保留原有', '只补空着的字段，已有值不动'),
+            radio('writeMode', 'overwrite', config.writeMode, (value) => save(Object.assign({}, config, { writeMode: value })), '覆盖已有', '按上面的勾选强制写入；未勾选的字段会被清空'),
+          ]),
+        );
+      };
+    }
+
     /* ─────────────────────────────── plugin ─────────────────────────────── */
 
     return {
+      /** The settings tab needs the slots service; the row buttons stay DOM-only. */
+      inject: ['slots'],
       /**
-       * Watch for rendered model rows and stamp one button on each.
-       * No inject list: the shell's DOM is the only surface used.
+       * Register the Auto-Meta tab, then watch for rendered model rows and
+       * stamp one button on each.
        */
       apply(ctx) {
         injectStyle();
+        injectTabStyle();
+        const Tab = makeTabComponent(require('react'));
+        ctx.slots.inject('settings.section', () =>
+          ctx.slots.register(
+            {
+              name: 'settings.section',
+              id: SECTION_ID,
+              order: SECTION_ORDER,
+              label: () => SECTION_LABEL,
+            },
+            Tab,
+          ),
+        );
         let frame = 0;
         let stopped = false;
         const schedule = () => {
@@ -1037,8 +1312,10 @@ window.__ModuleLoader__.load({
           stopped = true;
           observer.disconnect();
           if (frame !== 0) cancelAnimationFrame(frame);
-          const style = document.getElementById(STYLE_ID);
-          if (style !== null) style.remove();
+          for (const id of [STYLE_ID, TAB_STYLE_ID]) {
+            const style = document.getElementById(id);
+            if (style !== null) style.remove();
+          }
         };
         ctx.effect(() => dispose);
       },
@@ -1064,6 +1341,8 @@ window.__ModuleLoader__.load({
         matchOpenRouter,
         needsFit,
         compact,
+        normalizeSettings,
+        decideWrite,
       },
     };
   },
