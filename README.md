@@ -20,6 +20,8 @@ DSH 的模型元数据（上下文长度、输出上限、输入模态、思考�
   不想改就别点。
 - **首个点击会联网**：首次点击从 models.dev 拉取（约 1.5 MB），压缩后存进浏览器 IndexedDB，24 小时内不再请求。
   网络失败时退回旧缓存；旧缓存也没有则按钮提示参数获取失败。
+- **不挤掉删除按钮**：模型行原本是四轨网格，多一个按钮会换行把删除按钮压到第二行。插件检测到行溢出时
+  把该行改成单行 flex，多出的宽度由两个输入框按原比例分摊。
 
 ## 匹配分三级
 
@@ -45,7 +47,7 @@ DSH 的模型元数据（上下文长度、输出上限、输入模态、思考�
 ## 安装
 
 ```bash
-dsh plugin --profile <profile> add https://github.com/puny-code/dsh-auto-meta/releases/download/v0.2.0/dsh-auto-meta-0.2.0.tgz
+dsh plugin --profile <profile> add https://github.com/puny-code/dsh-auto-meta/releases/download/v0.2.1/dsh-auto-meta-0.2.1.tgz
 ```
 
 本地开发时也可以直接指目录：

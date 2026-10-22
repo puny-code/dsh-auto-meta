@@ -143,3 +143,17 @@ test('modalOf-free compact keeps only the fields the page needs', () => {
   const record = index.byModel.get('am')[0];
   assert.deepEqual(Object.keys(record).sort(), ['c', 'canonical', 'i', 'key', 'name', 'o', 'providerId', 'r']);
 });
+
+test('needsFit flags a grid whose children outgrow its tracks', () => {
+  // The shell row is four tracks: model id, model name, chevron, delete.
+  assert.equal(pure.needsFit('grid', 4, 4, undefined), false, 'untouched four-track row needs nothing');
+  assert.equal(pure.needsFit('grid', 4, 5, undefined), true, 'our button is the fifth child and would wrap');
+  assert.equal(pure.needsFit('grid', 5, 5, undefined), false, 'a build with a spare track already fits');
+});
+
+test('needsFit respects a wrapping flex row and ignores other layouts', () => {
+  assert.equal(pure.needsFit('flex', 0, 5, 'wrap'), true);
+  assert.equal(pure.needsFit('flex', 0, 5, 'nowrap'), false, 'already single-line, do not touch it');
+  assert.equal(pure.needsFit('block', 0, 5, undefined), false, 'unknown layout: leave it alone');
+  assert.equal(pure.needsFit('grid', 0, 5, undefined), false, 'no tracks resolved yet: wait for the next scan');
+});

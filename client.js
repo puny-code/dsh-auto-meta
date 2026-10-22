@@ -34,6 +34,8 @@ window.__ModuleLoader__.load({
     /** Marker that also carries the insertion state; queried by the observer. */
     const MARK = 'data-dsh-auto-meta';
     const TITLE = '自动填写';
+    /** Class that re-lays out a model row so our extra button stays inline. */
+    const FIT_CLASS = 'dsh-auto-meta-fit';
     const CATALOG_URL = 'https://models.dev/api.json';
     const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
     const FETCH_TIMEOUT_MS = 20000;
@@ -710,6 +712,30 @@ window.__ModuleLoader__.load({
       return button;
     }
 
+    /**
+     * Keep the row on one line now that it holds one more control than the
+     * shell designed for. The row is a `grid` with a fixed track count (two
+     * flexible tracks for the text inputs, then `auto` tracks for the buttons),
+     * so a fifth child spills onto an implicit second row and pushes the delete
+     * button down. When that is detected, the row is switched to a flex line
+     * whose flexible tracks the inputs share — the extra button then costs the
+     * two inputs ~34px instead of a wrapped row.
+     */
+    function needsFit(display, trackCount, childCount, flexWrap) {
+      if (display.indexOf('grid') !== -1) return trackCount > 0 && childCount > trackCount;
+      if (display.indexOf('flex') !== -1) return flexWrap === 'wrap';
+      return false;
+    }
+
+    function fitRow(row) {
+      const style = getComputedStyle(row);
+      const tracks = String(style.gridTemplateColumns || '').trim();
+      const trackCount = tracks === '' || tracks === 'none' ? 0 : tracks.split(/\s+/).length;
+      if (needsFit(style.display, trackCount, row.children.length, style.flexWrap)) {
+        row.classList.add(FIT_CLASS);
+      }
+    }
+
     /** Stamp the button onto every rendered model row (idempotent). */
     function scan() {
       const entries = document.querySelectorAll('[class*="modelEntry"]');
@@ -720,6 +746,7 @@ window.__ModuleLoader__.load({
         const row = chevron.parentElement;
         if (row === null || row.querySelector('input[type="text"]') === null) continue;
         row.insertBefore(makeButton(chevron), chevron);
+        fitRow(row);
       }
     }
 
@@ -733,6 +760,12 @@ window.__ModuleLoader__.load({
         'button[' + MARK + '][data-state="miss"]{color:#e8590c}',
         'button[' + MARK + '][data-state="error"]{color:#e03131}',
         'button[' + MARK + '][data-state="busy"]{opacity:.45;cursor:progress}',
+        // Row re-layout: only applied when the shell's own grid would wrap.
+        // The selectors outrank the shell's module classes so the row, not the
+        // button, is what gives up the ~34px the extra control needs.
+        'div[class*="modelRow"].' + FIT_CLASS + '{display:flex;align-items:center;gap:6px;flex-wrap:nowrap}',
+        'div[class*="modelRow"].' + FIT_CLASS + ' > input{flex:1 1 0;min-width:0;width:auto}',
+        'div[class*="modelRow"].' + FIT_CLASS + ' > input:first-of-type{flex:1.4 1 0}',
       ].join('\n');
       document.head.appendChild(style);
     }
@@ -779,6 +812,7 @@ window.__ModuleLoader__.load({
         resolveModel,
         consensusFields,
         resolveMeta,
+        needsFit,
         compact,
       },
     };

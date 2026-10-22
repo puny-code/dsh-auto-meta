@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-meta",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "One button on each settings → Models row fills the model's context window, output cap, input modalities, and thinking levels from models.dev.",
   "type": "module",
   "author": "puny-code",
