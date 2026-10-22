@@ -1,0 +1,52 @@
+{
+  "name": "dsh-auto-meta",
+  "version": "0.2.0",
+  "description": "One button on each settings → Models row fills the model's context window, output cap, input modalities, and thinking levels from models.dev.",
+  "type": "module",
+  "author": "puny-code",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/puny-code/dsh-auto-meta.git"
+  },
+  "homepage": "https://github.com/puny-code/dsh-auto-meta#readme",
+  "bugs": {
+    "url": "https://github.com/puny-code/dsh-auto-meta/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/client.test.mjs"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "client-plugin",
+    "models",
+    "models.dev",
+    "provider"
+  ],
+  "license": "MIT"
+}

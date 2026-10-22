@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Model Metadata",
+    "description": "Adds an “Auto-fill” button to every model row in Settings → Models and fills that model's real context window, output cap, input modalities, and reasoning levels from the models.dev catalog."
+  }
+}

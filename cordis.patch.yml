@@ -1,0 +1,5 @@
+# Loader row for the plugin. All the work happens in the web client (`./client`),
+# so the host half takes no configuration.
+- insert:
+    - id: auto-meta
+      name: dsh-auto-meta

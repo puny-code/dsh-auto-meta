@@ -1,0 +1,145 @@
+/**
+ * Unit tests for the client half's pure logic.
+ *
+ * `client.js` is a browser module: it registers itself with
+ * `window.__ModuleLoader__` and touches `document` only from inside `apply()`
+ * and the fill driver. A minimal window shim is therefore enough to load it in
+ * Node and exercise the catalog logic through the `__pure` seam.
+ */
+
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+let captured;
+globalThis.window = {
+  __ModuleLoader__: {
+    load(spec) {
+      captured = spec;
+    },
+  },
+};
+
+await import('../client.js');
+assert.equal(captured.id, 'dsh-auto-meta', 'client registers itself under the package id');
+
+const api = captured.factory(() => ({}));
+const pure = api.__pure;
+
+assert.equal(typeof api.apply, 'function');
+assert.equal(typeof pure.resolveMeta, 'function');
+
+const EFFORT_OPTIONS = [{ type: 'effort', values: ['none', 'low', 'high', 'max'] }];
+
+/** A tiny models.dev-shaped document, fed through `compact()` like the real one. */
+function catalog(providers) {
+  return pure.buildIndex(pure.compact(providers));
+}
+
+test('toEfforts maps effort values and keeps "off" as null', () => {
+  assert.deepEqual(pure.toEfforts(EFFORT_OPTIONS), { off: null, low: 'low', high: 'high', max: 'max' });
+});
+
+test('toEfforts refuses a bare toggle, which names no wire value', () => {
+  assert.equal(pure.toEfforts([{ type: 'toggle' }]), undefined);
+  assert.equal(pure.toEfforts([]), undefined);
+  assert.equal(pure.toEfforts(undefined), undefined);
+});
+
+test('toEfforts refuses a map that offers nothing beyond "off"', () => {
+  assert.equal(pure.toEfforts([{ type: 'effort', values: ['none'] }]), undefined);
+});
+
+test('planReasoning orders levels ascending and keeps null wire for off', () => {
+  assert.deepEqual(pure.planReasoning({ off: null, high: 'high', low: 'low' }), [
+    { level: 'off', wire: null },
+    { level: 'low', wire: 'low' },
+    { level: 'high', wire: 'high' },
+  ]);
+  assert.equal(pure.planReasoning(undefined), undefined);
+});
+
+test('norm folds punctuation, case, and provider separators', () => {
+  assert.equal(pure.norm('DeepSeek-V4.1 Flash'), pure.norm('deepseek_v4_1flash'));
+  assert.equal(pure.norm(undefined), '');
+});
+
+test('route tier wins when the configured provider carries the model', () => {
+  const index = catalog({
+    'my-gateway': {
+      name: 'My Gateway',
+      models: {
+        'glm-5': {
+          name: 'GLM-5',
+          limit: { context: 200000, output: 64000 },
+          modalities: { input: ['text', 'image'] },
+          reasoning_options: EFFORT_OPTIONS,
+          canonical_model_id: 'zai/glm-5',
+        },
+      },
+    },
+    zai: {
+      name: 'Z.ai',
+      models: {
+        'glm-5': { name: 'GLM-5', limit: { context: 128000, output: 8192 } },
+      },
+    },
+  });
+  const meta = pure.resolveMeta(index, 'glm-5', 'my-gateway');
+  assert.equal(meta.tier, 'route');
+  assert.equal(meta.source, 'my-gateway');
+  assert.equal(meta.fields.contextWindow, 200000);
+  assert.equal(meta.fields.maxTokens, 64000);
+  assert.deepEqual(meta.fields.input, ['text', 'image']);
+  assert.deepEqual(meta.fields.reasoningEfforts, { off: null, low: 'low', high: 'high', max: 'max' });
+});
+
+test('vendor tier follows the canonical id when the route has no own record', () => {
+  const index = catalog({
+    openrouter: {
+      name: 'OpenRouter',
+      models: {
+        'zai/glm-5': {
+          name: 'GLM-5',
+          limit: { context: 200000, output: 64000 },
+          canonical_model_id: 'zai/glm-5',
+        },
+      },
+    },
+    zai: {
+      name: 'Z.ai',
+      models: { 'glm-5': { name: 'GLM-5', limit: { context: 128000, output: 8192 } } },
+    },
+  });
+  const meta = pure.resolveMeta(index, 'zai/glm-5', 'unrelated-route');
+  assert.equal(meta.tier, 'vendor');
+  assert.equal(meta.source, 'zai');
+  assert.equal(meta.fields.contextWindow, 128000);
+  assert.equal(meta.fields.maxTokens, 8192);
+});
+
+test('consensus tier takes only majority fields across carriers', () => {
+  const index = catalog({
+    a: { name: 'A', models: { 'x-model': { limit: { context: 1000, output: 100 }, modalities: { input: ['text'] } } } },
+    b: { name: 'B', models: { 'x-model': { limit: { context: 1000, output: 100 }, modalities: { input: ['text', 'image'] } } } },
+    c: { name: 'C', models: { 'x-model': { limit: { context: 999, output: 100 }, modalities: { input: ['text'] } } } },
+  });
+  const meta = pure.resolveMeta(index, 'x-model', 'nowhere');
+  assert.equal(meta.tier, 'consensus');
+  assert.equal(meta.fields.contextWindow, 1000, '2 of 3 agree');
+  assert.equal(meta.fields.maxTokens, 100, '3 of 3 agree');
+  assert.deepEqual(meta.fields.input, ['text'], 'only 1 of 3 declares image, so text only');
+});
+
+test('an unknown id resolves to nothing instead of guessing', () => {
+  const index = catalog({ a: { name: 'A', models: { known: { limit: { context: 1, output: 1 } } } } });
+  assert.equal(pure.resolveMeta(index, 'unknown', 'a').tier, 'none');
+  assert.deepEqual(pure.resolveMeta(index, 'unknown', 'a').fields, {});
+});
+
+test('modalOf-free compact keeps only the fields the page needs', () => {
+  const index = catalog({
+    a: { name: 'A', models: { m: { limit: { context: 10, output: 5 }, modalities: { input: ['text'] }, canonical_model_id: 'a/m' } } },
+  });
+  const record = index.byModel.get('am')[0];
+  assert.deepEqual(Object.keys(record).sort(), ['c', 'canonical', 'i', 'key', 'name', 'o', 'providerId', 'r']);
+});
