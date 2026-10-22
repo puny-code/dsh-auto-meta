@@ -2,7 +2,7 @@
  * dsh-auto-meta — Client half.
  *
  * Adds one icon button ("自动填写") to every model row on the settings →
- * Models page. Clicking it resolves that row's model id against the models.dev
+ * Models page. Clicking it resolves that row's model id against the OpenRouter
  * catalog and fills the row's own inputs: context window, output cap, input
  * modalities, and thinking levels.
  *
@@ -22,10 +22,15 @@
  *    values flow through the same parser as typed input, and the user's Save
  *    persists them.
  *
- * Catalog: fetched from models.dev in the browser (the endpoint sends
- * `Access-Control-Allow-Origin: *`), compacted, and cached in IndexedDB for 24h
- * (the raw document is ~1.5 MB, over the localStorage budget). A stale cache is
- * still used when the network fails.
+ * Catalog: OpenRouter's `/api/v1/models` is the primary source — it states a
+ * model's `reasoning.supported_efforts` directly, which models.dev gets wrong
+ * for some entries (it reported `low/medium/high` for `deepseek-v4.1-flash`,
+ * whose real levels are `none/low/high/max`). The endpoint sends
+ * `Access-Control-Allow-Origin: *`, so the browser can fetch it; the cleaned
+ * document is small enough for IndexedDB and is cached for 24h. models.dev is
+ * kept as a *field-level* fallback for models OpenRouter lists without the
+ * field we need (it is 6 MB, so it is only fetched when a lookup actually
+ * misses something). A stale cache beats no cache when the network fails.
  */
 
 window.__ModuleLoader__.load({
@@ -36,9 +41,13 @@ window.__ModuleLoader__.load({
     const TITLE = '自动填写';
     /** Class that re-lays out a model row so our extra button stays inline. */
     const FIT_CLASS = 'dsh-auto-meta-fit';
-    const CATALOG_URL = 'https://models.dev/api.json';
+    const CATALOG_URL = 'https://openrouter.ai/api/v1/models';
+    /** Secondary source, consulted per field only when OpenRouter is silent. */
+    const FALLBACK_URL = 'https://models.dev/api.json';
     const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
     const FETCH_TIMEOUT_MS = 20000;
+    /** Similarity below this is treated as "not the same model". */
+    const FUZZY_FLOOR = 0.8;
     const STATE_MS = 1600;
 
     /** pi-ai's thinking levels, ascending. */
@@ -101,7 +110,9 @@ window.__ModuleLoader__.load({
       if (Number.isInteger(record.o) && record.o > 0) fields.maxTokens = record.o;
       const inputs = Array.isArray(record.i) ? record.i : [];
       if (inputs.length > 0) fields.input = MODALITIES.filter((modality) => inputs.includes(modality));
-      const efforts = toEfforts(record.r);
+      // `e` is an already-normalized pi-ai map (OpenRouter), `r` the raw
+      // models.dev option list; records carry one or the other.
+      const efforts = record.e !== undefined ? record.e : toEfforts(record.r);
       if (efforts !== undefined) fields.reasoningEfforts = efforts;
       return fields;
     }
@@ -298,13 +309,175 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /* ───────────────── OpenRouter catalog: clean, index, match ───────────── */
+
+    /** `deepseek/deepseek-v4.1-flash:batch` → `deepseek-v4.1-flash`. */
+    function leafOf(id) {
+      return String(id === undefined || id === null ? '' : id)
+        .replace(/^.*\//, '')
+        .replace(/:.*$/, '');
+    }
+
+    /** Drop a trailing snapshot date (`-20261017`, `-1017`) or version. */
+    function stripSnapshot(text) {
+      return String(text).replace(/-?\d{4,8}$/, '').replace(/-?v\d+$/, '');
+    }
+
+    /** Comparison key for a model id: case, punctuation and snapshot dropped. */
+    function baseId(id) {
+      return norm(stripSnapshot(leafOf(id)));
+    }
+
+    /** Dice coefficient over character bigrams; 1 is identical. */
+    function similarity(a, b) {
+      if (a === b) return 1;
+      if (a.length < 2 || b.length < 2) return 0;
+      const count = (text) => {
+        const grams = new Map();
+        for (let index = 0; index < text.length - 1; index += 1) {
+          const gram = text.slice(index, index + 2);
+          grams.set(gram, (grams.get(gram) || 0) + 1);
+        }
+        return grams;
+      };
+      const left = count(a);
+      const right = count(b);
+      let shared = 0;
+      let total = 0;
+      for (const [, size] of left) total += size;
+      for (const [gram, size] of right) {
+        total += size;
+        shared += Math.min(size, left.get(gram) || 0);
+      }
+      return total === 0 ? 0 : (2 * shared) / total;
+    }
+
+    /**
+     * OpenRouter `reasoning.supported_efforts` → pi-ai `reasoningEfforts`.
+     * OpenRouter still uses `none` for "thinking off"; the page calls it `off`.
+     */
+    function effortMap(values) {
+      const list = Array.isArray(values) ? values : [];
+      const map = {};
+      for (const raw of list) {
+        const value = String(raw === undefined || raw === null ? '' : raw).trim().toLowerCase();
+        if (value === '') continue;
+        if (OFF_ALIASES.has(value)) {
+          map.off = null;
+          continue;
+        }
+        if (THINKING_LEVELS.includes(value)) map[value] = value;
+      }
+      return Object.keys(map).some((level) => level !== 'off') ? map : undefined;
+    }
+
+    function remember(map, key, record) {
+      const list = map.get(key);
+      if (list === undefined) map.set(key, [record]);
+      else list.push(record);
+    }
+
+    /**
+     * Clean an OpenRouter payload into records the page can use. One entry per
+     * model; ids that differ only by `:variant` stay as separate records so the
+     * plain one can be preferred at lookup time.
+     */
+    function cleanOpenRouter(doc) {
+      const rows = doc !== null && typeof doc === 'object' && Array.isArray(doc.data) ? doc.data : [];
+      const byBase = new Map();
+      const byCanonical = new Map();
+      let count = 0;
+      for (const model of rows) {
+        if (model === null || typeof model !== 'object') continue;
+        const id = typeof model.id === 'string' ? model.id : '';
+        const base = baseId(id);
+        if (base === '') continue;
+        const top = model.top_provider !== null && typeof model.top_provider === 'object' ? model.top_provider : {};
+        const arch = model.architecture !== null && typeof model.architecture === 'object' ? model.architecture : {};
+        const reasoning = model.reasoning !== null && typeof model.reasoning === 'object' ? model.reasoning : {};
+        const record = {
+          id,
+          c: Number.isInteger(model.context_length) && model.context_length > 0 ? model.context_length : undefined,
+          o: Number.isInteger(top.max_completion_tokens) && top.max_completion_tokens > 0
+            ? top.max_completion_tokens
+            : undefined,
+          i: Array.isArray(arch.input_modalities) ? arch.input_modalities : [],
+          e: effortMap(reasoning.supported_efforts),
+          canonical: typeof model.canonical_slug === 'string' ? baseId(model.canonical_slug) : '',
+          created: Number.isFinite(model.created) ? model.created : 0,
+          variant: id.indexOf(':') !== -1,
+        };
+        count += 1;
+        remember(byBase, base, record);
+        if (record.canonical !== '') remember(byCanonical, record.canonical, record);
+      }
+      return { version: 2, count, byBase, byCanonical };
+    }
+
+    /** Prefer the plain id over a variant, then the newest, then the shortest. */
+    function pickRecord(records) {
+      let best = records[0];
+      for (const record of records) {
+        if (record.variant !== best.variant) {
+          if (!record.variant) best = record;
+          continue;
+        }
+        if (record.created !== best.created) {
+          if (record.created > best.created) best = record;
+          continue;
+        }
+        if (record.id.length < best.id.length) best = record;
+      }
+      return best;
+    }
+
+    /**
+     * One id → one record: exact leaf, then the canonical slug the catalog
+     * itself declares, then a bounded fuzzy score. `tier` says which one won so
+     * the button can be honest about a fuzzy hit.
+     */
+    function matchOpenRouter(catalog, modelId) {
+      const key = baseId(modelId);
+      if (key === '') return { tier: 'none', record: undefined };
+      const exact = catalog.byBase.get(key);
+      if (exact !== undefined) {
+        // Prefer the record that spells the id the same way: a request for
+        // `…-flash` should not silently pick the newest dated snapshot, and a
+        // request for `…-flash-1017` should get that snapshot.
+        const wanted = norm(leafOf(modelId));
+        const sameSpelling = exact.find((record) => norm(leafOf(record.id)) === wanted);
+        return { tier: 'exact', record: sameSpelling !== undefined ? sameSpelling : pickRecord(exact) };
+      }
+      const aliased = catalog.byCanonical.get(key);
+      if (aliased !== undefined) return { tier: 'canonical', record: pickRecord(aliased) };
+      let found;
+      let score = 0;
+      for (const [base, records] of catalog.byBase) {
+        // A prefix relation is a strong signal for snapshot variants
+        // (`…-flash-fast` → `…-flash`), but only once both sides are long
+        // enough that a prefix cannot be a coincidence (`gpt-5` vs `gpt-5.4`).
+        const candidate =
+          base.length >= 8 && key.length >= 8 && (base.startsWith(key) || key.startsWith(base))
+            ? 0.9
+            : similarity(base, key);
+        if (candidate > score) {
+          score = candidate;
+          found = records;
+        }
+      }
+      if (found !== undefined && score >= FUZZY_FLOOR) {
+        return { tier: 'fuzzy', record: pickRecord(found), score: Math.round(score * 100) / 100 };
+      }
+      return { tier: 'none', record: undefined, score: Math.round(score * 100) / 100 };
+    }
+
     /* ────────────────────────────── catalog ─────────────────────────────── */
 
-    let memoryCache;
-    let indexPromise;
+    let dbPromise;
 
     function openDb() {
-      return new Promise((resolve) => {
+      if (dbPromise !== undefined) return dbPromise;
+      dbPromise = new Promise((resolve) => {
         let request;
         try {
           request = indexedDB.open('dsh-auto-meta', 1);
@@ -319,33 +492,128 @@ window.__ModuleLoader__.load({
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => resolve(null);
       });
+      return dbPromise;
     }
 
-    async function cacheRead() {
-      if (memoryCache !== undefined) return memoryCache;
+    async function cacheRead(key) {
       const db = await openDb();
       if (db === null) return undefined;
-      const stored = await new Promise((resolve) => {
-        const request = db.transaction('kv', 'readonly').objectStore('kv').get('catalog');
+      return new Promise((resolve) => {
+        const request = db.transaction('kv', 'readonly').objectStore('kv').get(key);
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => resolve(undefined);
       });
-      if (stored && typeof stored === 'object' && stored.providers) memoryCache = stored;
-      return memoryCache;
     }
 
-    async function cacheWrite(entry) {
-      memoryCache = entry;
+    async function cacheWrite(key, entry) {
       const db = await openDb();
       if (db === null) return;
       try {
-        db.transaction('kv', 'readwrite').objectStore('kv').put(entry, 'catalog');
+        db.transaction('kv', 'readwrite').objectStore('kv').put(entry, key);
       } catch (error) {
         /* a full quota must not break the fill */
       }
     }
 
-    /** Keep only the fields the page needs; the raw document is ~1.5 MB. */
+    async function fetchJson(url) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, { signal: controller.signal, cache: 'no-cache', credentials: 'omit' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return await response.json();
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    let openRouterPromise;
+
+    /** Fresh cache → network → stale cache → error. */
+    async function openRouterCatalog() {
+      const cached = await cacheRead('openrouter');
+      if (cached !== undefined && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.catalog;
+      try {
+        const catalog = cleanOpenRouter(await fetchJson(CATALOG_URL));
+        await cacheWrite('openrouter', { fetchedAt: Date.now(), catalog });
+        return catalog;
+      } catch (error) {
+        if (cached !== undefined) return cached.catalog;
+        throw error;
+      }
+    }
+
+    let modelsDevPromise;
+
+    /** Optional field-level fallback; never throws, so it cannot block a fill. */
+    function modelsDevCatalog() {
+      if (modelsDevPromise === undefined) {
+        modelsDevPromise = (async () => {
+          const cached = await cacheRead('modelsdev');
+          if (cached !== undefined && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.catalog;
+          try {
+            const catalog = { providers: compact(await fetchJson(FALLBACK_URL)) };
+            await cacheWrite('modelsdev', { fetchedAt: Date.now(), catalog });
+            return catalog;
+          } catch (error) {
+            return cached === undefined ? undefined : cached.catalog;
+          }
+        })().then((catalog) => catalog);
+      }
+      return modelsDevPromise;
+    }
+
+    const FIELD_KEYS = ['contextWindow', 'maxTokens', 'input', 'reasoningEfforts'];
+
+    let mdIndexSource;
+    let mdIndex;
+
+    function modelsDevIndex(providers) {
+      if (mdIndexSource !== providers) {
+        mdIndexSource = providers;
+        mdIndex = buildIndex(providers);
+      }
+      return mdIndex;
+    }
+
+    /**
+     * Resolve one row. OpenRouter answers; anything it leaves blank is asked of
+     * models.dev field by field, never wholesale — the documented reason is
+     * that models.dev states wrong thinking levels for some models while
+     * OpenRouter has them right.
+     */
+    async function resolveForRow(modelId) {
+      const catalog = await openRouterCatalog();
+      const hit = matchOpenRouter(catalog, modelId);
+      const fields = hit.record === undefined ? {} : deriveFields(hit.record);
+      const sources = [];
+      if (hit.record !== undefined) sources.push('openrouter');
+
+      const gaps = FIELD_KEYS.filter((key) => fields[key] === undefined);
+      if (gaps.length > 0) {
+        const fallback = await modelsDevCatalog();
+        if (fallback !== undefined) {
+          const meta = resolveMeta(modelsDevIndex(fallback.providers), modelId, '');
+          let used = false;
+          for (const key of gaps) {
+            if (meta.fields[key] !== undefined) {
+              fields[key] = meta.fields[key];
+              used = true;
+            }
+          }
+          if (used) sources.push('models.dev');
+        }
+      }
+      return {
+        fields,
+        tier: hit.tier,
+        matched: hit.record === undefined ? '' : hit.record.id,
+        score: hit.score,
+        sources,
+      };
+    }
+
+    /** Keep only the fields the page needs; the raw document is ~6 MB. */
     function compact(doc) {
       const providers = {};
       for (const [providerId, provider] of Object.entries(doc || {})) {
@@ -365,50 +633,6 @@ window.__ModuleLoader__.load({
         providers[providerId] = { n: typeof provider.name === 'string' ? provider.name : providerId, m: models };
       }
       return providers;
-    }
-
-    async function fetchCatalog() {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-      try {
-        const response = await fetch(CATALOG_URL, {
-          signal: controller.signal,
-          cache: 'no-cache',
-          credentials: 'omit',
-        });
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const doc = await response.json();
-        const entry = { fetchedAt: Date.now(), providers: compact(doc) };
-        await cacheWrite(entry);
-        return entry;
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
-    /** Compact catalog: fresh cache → network → stale cache. */
-    async function readCatalog() {
-      const cached = await cacheRead();
-      const fresh = cached !== undefined && Date.now() - cached.fetchedAt < CACHE_TTL_MS;
-      if (fresh) return cached;
-      try {
-        return await fetchCatalog();
-      } catch (error) {
-        if (cached !== undefined) return cached;
-        throw error;
-      }
-    }
-
-    function catalogIndex() {
-      if (indexPromise === undefined) {
-        indexPromise = readCatalog()
-          .then((entry) => buildIndex(entry.providers))
-          .catch((error) => {
-            indexPromise = undefined;
-            throw error;
-          });
-      }
-      return indexPromise;
     }
 
     /* ──────────────────────────── DOM driving ───────────────────────────── */
@@ -637,18 +861,17 @@ window.__ModuleLoader__.load({
       return true;
     }
 
-    /** Fill one row from its model id; returns a short outcome string. */
+    /** Fill one row from its model id; returns the outcome plus its provenance. */
     async function fillRow(row) {
       const modelId = modelIdOf(row);
-      if (modelId === '') return 'empty';
-      const index = await catalogIndex();
-      const meta = resolveMeta(index, modelId, '');
-      const fields = meta.fields;
-      if (Object.keys(fields).length === 0) return 'miss';
+      if (modelId === '') return { outcome: 'empty' };
+      const resolved = await resolveForRow(modelId);
+      const fields = resolved.fields;
+      if (Object.keys(fields).length === 0) return { outcome: 'miss' };
       const chevron = row.querySelector('button[aria-expanded]');
-      if (chevron === null) return 'miss';
+      if (chevron === null) return { outcome: 'miss' };
       const panel = await openPanel(chevron, row);
-      if (panel === undefined) return 'miss';
+      if (panel === undefined) return { outcome: 'miss' };
       const numbers = numericInputs(panel);
       if (fields.contextWindow !== undefined && numbers.contextWindow) {
         setInput(numbers.contextWindow, String(fields.contextWindow));
@@ -658,7 +881,26 @@ window.__ModuleLoader__.load({
       }
       if (fields.input !== undefined) fillInputs(panel, fields.input);
       if (fields.reasoningEfforts !== undefined) await fillReasoning(panel, fields.reasoningEfforts);
-      return 'ok';
+      return {
+        outcome: 'ok',
+        tier: resolved.tier,
+        matched: resolved.matched,
+        score: resolved.score,
+        sources: resolved.sources,
+      };
+    }
+
+    /** Tooltip for a successful fill: say when the hit was fuzzy or mixed. */
+    function filledMessage(result) {
+      const notes = [];
+      if (result.tier === 'fuzzy') {
+        notes.push('按 ' + result.matched + ' 模糊匹配');
+      } else if (result.tier === 'canonical') {
+        notes.push('按目录别名 ' + result.matched + ' 匹配');
+      }
+      if (result.sources.length > 1) notes.push('缺项取自 models.dev');
+      else if (result.sources[0] === 'models.dev') notes.push('来自 models.dev');
+      return notes.length === 0 ? '已填入' : '已填入（' + notes.join('；') + '）';
     }
 
     /* ───────────────────────────── injection ────────────────────────────── */
@@ -700,10 +942,10 @@ window.__ModuleLoader__.load({
         if (row === null) return;
         flash(button, 'busy');
         fillRow(row).then(
-          (outcome) => {
-            if (outcome === 'ok') flash(button, 'ok', '已填入');
-            else if (outcome === 'empty') flash(button, 'miss', '先填写模型 ID');
-            else if (outcome === 'miss') flash(button, 'miss', 'models.dev 未收录该模型');
+          (result) => {
+            if (result.outcome === 'ok') flash(button, 'ok', filledMessage(result));
+            else if (result.outcome === 'empty') flash(button, 'miss', '先填写模型 ID');
+            else if (result.outcome === 'miss') flash(button, 'miss', 'OpenRouter 与 models.dev 均未收录该模型');
             else flash(button, 'error', '该行缺少可填写项');
           },
           () => flash(button, 'error', '参数获取失败'),
@@ -804,6 +1046,7 @@ window.__ModuleLoader__.load({
       __pure: {
         norm,
         toEfforts,
+        effortMap,
         planReasoning,
         deriveFields,
         buildIndex,
@@ -812,6 +1055,13 @@ window.__ModuleLoader__.load({
         resolveModel,
         consensusFields,
         resolveMeta,
+        leafOf,
+        stripSnapshot,
+        baseId,
+        similarity,
+        cleanOpenRouter,
+        pickRecord,
+        matchOpenRouter,
         needsFit,
         compact,
       },

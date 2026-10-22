@@ -1,7 +1,7 @@
 {
   "name": "dsh-auto-meta",
-  "version": "0.2.1",
-  "description": "One button on each settings → Models row fills the model's context window, output cap, input modalities, and thinking levels from models.dev.",
+  "version": "0.3.0",
+  "description": "One button on each settings → Models row fills the model's context window, output cap, input modalities, and thinking levels from the OpenRouter model catalog.",
   "type": "module",
   "author": "puny-code",
   "repository": {
@@ -45,7 +45,7 @@
     "dsh-plugin",
     "client-plugin",
     "models",
-    "models.dev",
+    "openrouter",
     "provider"
   ],
   "license": "MIT"

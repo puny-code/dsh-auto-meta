@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 
 let captured;
@@ -156,4 +157,122 @@ test('needsFit respects a wrapping flex row and ignores other layouts', () => {
   assert.equal(pure.needsFit('flex', 0, 5, 'nowrap'), false, 'already single-line, do not touch it');
   assert.equal(pure.needsFit('block', 0, 5, undefined), false, 'unknown layout: leave it alone');
   assert.equal(pure.needsFit('grid', 0, 5, undefined), false, 'no tracks resolved yet: wait for the next scan');
+});
+
+/* ───────────────────── OpenRouter (primary) catalog ───────────────────── */
+
+/** Three real `deepseek-v4.1-flash` entries, captured from the live endpoint. */
+const OPENROUTER_FIXTURE = JSON.parse(
+  fs.readFileSync(new URL('./fixtures/openrouter-deepseek-v4.1-flash.json', import.meta.url), 'utf8'),
+);
+
+test('effortMap turns OpenRouter "none" into the off level', () => {
+  assert.deepEqual(pure.effortMap(['max', 'high', 'low', 'none']), { off: null, low: 'low', high: 'high', max: 'max' });
+  assert.deepEqual(pure.effortMap(['medium']), { medium: 'medium' });
+  assert.equal(pure.effortMap(['none']), undefined, 'a toggle with no real level fills nothing');
+  assert.equal(pure.effortMap(undefined), undefined);
+});
+
+test('baseId drops the provider prefix, variant suffix and snapshot date', () => {
+  assert.equal(pure.baseId('deepseek/deepseek-v4.1-flash'), 'deepseekv41flash');
+  assert.equal(pure.baseId('deepseek/deepseek-v4.1-flash:batch'), pure.baseId('deepseek/deepseek-v4.1-flash'));
+  assert.equal(pure.baseId('deepseek-v4.1-flash-1017'), pure.baseId('deepseek-v4.1-flash'));
+  assert.equal(pure.baseId('DeepSeek V4.1 Flash'), pure.baseId('deepseek-v4.1-flash'));
+});
+
+test('cleanOpenRouter indexes by leaf id and by canonical slug', () => {
+  const catalog = pure.cleanOpenRouter(OPENROUTER_FIXTURE);
+  assert.equal(catalog.count, 3);
+  const records = catalog.byBase.get(pure.baseId('deepseek-v4.1-flash'));
+  assert.equal(records.length, 3, 'plain, dated snapshot and :batch variant share one leaf key');
+  assert.ok(catalog.byCanonical.size >= 1);
+});
+
+test('a variant id loses to its plain sibling', () => {
+  const records = [
+    { id: 'x/model:batch', variant: true, created: 9, c: 1 },
+    { id: 'x/model', variant: false, created: 1, c: 2 },
+  ];
+  assert.equal(pure.pickRecord(records).id, 'x/model');
+});
+
+test('deepseek-v4.1-flash resolves to none/low/high/max, as OpenRouter states', () => {
+  const catalog = pure.cleanOpenRouter(OPENROUTER_FIXTURE);
+  const hit = pure.matchOpenRouter(catalog, 'deepseek-v4.1-flash');
+  assert.equal(hit.tier, 'exact');
+  const fields = pure.deriveFields(hit.record);
+  assert.deepEqual(fields.reasoningEfforts, { off: null, low: 'low', high: 'high', max: 'max' });
+  assert.deepEqual(
+    pure.planReasoning(fields.reasoningEfforts).map((entry) => entry.level),
+    ['off', 'low', 'high', 'max'],
+  );
+  assert.equal(fields.contextWindow, 1048576);
+  assert.equal(fields.maxTokens, 943718);
+  assert.deepEqual(fields.input, ['text', 'image']);
+});
+
+test('a snapshot id picks its own snapshot entry', () => {
+  const catalog = pure.cleanOpenRouter(OPENROUTER_FIXTURE);
+  const hit = pure.matchOpenRouter(catalog, 'deepseek-v4.1-flash-1017');
+  assert.equal(hit.tier, 'exact');
+  assert.equal(hit.record.id, 'deepseek/deepseek-v4.1-flash-1017');
+});
+
+test('matchOpenRouter falls back to the canonical slug, then to fuzzy, then gives up', () => {
+  const payload = {
+    data: [
+      {
+        id: 'z-ai/glm-5.2-turbo',
+        canonical_slug: 'z-ai/glm-5.2',
+        context_length: 1000000,
+        top_provider: { max_completion_tokens: 131072 },
+        architecture: { input_modalities: ['text'] },
+        reasoning: { supported_efforts: ['low', 'high'] },
+        created: 5,
+      },
+      {
+        id: 'qwen/qwen3.8-max-0902',
+        context_length: 1000000,
+        top_provider: { max_completion_tokens: 131072 },
+        architecture: { input_modalities: ['text'] },
+        reasoning: { supported_efforts: ['low', 'high'] },
+        created: 5,
+      },
+      {
+        id: 'deepseek/deepseek-v4.1-flash',
+        context_length: 1048576,
+        top_provider: { max_completion_tokens: 393216 },
+        architecture: { input_modalities: ['text', 'image'] },
+        reasoning: { supported_efforts: ['none', 'low', 'high', 'max'] },
+        created: 3,
+      },
+    ],
+  };
+  const catalog = pure.cleanOpenRouter(payload);
+  const aliased = pure.matchOpenRouter(catalog, 'glm-5.2');
+  assert.equal(aliased.tier, 'canonical', 'the id is not in the catalog, but its canonical slug is');
+  assert.equal(aliased.record.id, 'z-ai/glm-5.2-turbo');
+  const snapshot = pure.matchOpenRouter(catalog, 'qwen3.8-max');
+  assert.equal(snapshot.tier, 'exact', 'a dated snapshot answers the plain id');
+  assert.equal(snapshot.record.id, 'qwen/qwen3.8-max-0902');
+  const fuzzy = pure.matchOpenRouter(catalog, 'deepseek-v4.1-flash-fast');
+  assert.equal(fuzzy.tier, 'fuzzy', 'a prefix relation is a degradation, not an exact hit');
+  assert.equal(fuzzy.record.id, 'deepseek/deepseek-v4.1-flash');
+  assert.equal(pure.matchOpenRouter(catalog, 'no-such-model-anywhere').tier, 'none');
+});
+
+test('models listed without efforts stay unanswered instead of being guessed', () => {
+  const payload = {
+    data: [
+      {
+        id: 'xiaomi/mimo-v2.6-flash',
+        context_length: 1050000,
+        top_provider: { max_completion_tokens: 131072 },
+        architecture: { input_modalities: ['text', 'image'] },
+      },
+    ],
+  };
+  const fields = pure.deriveFields(pure.matchOpenRouter(pure.cleanOpenRouter(payload), 'mimo-v2.6-flash').record);
+  assert.equal(fields.reasoningEfforts, undefined, 'no reasoning object means the levels are left untouched');
+  assert.equal(fields.contextWindow, 1050000);
 });
